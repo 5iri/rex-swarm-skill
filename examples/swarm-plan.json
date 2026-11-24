@@ -1,0 +1,30 @@
+{
+  "goal": "Lazy windowed FST loading in tof_lazy + live Surfer WCP hop-mirroring demo",
+  "lead": "lead",
+  "workers": {
+    "codex": {
+      "harness": "codex",
+      "task": "Build the time-windowed FstFilter FST loader in wellen_ext/src/windows.rs and write bench/results_windowed.json. Publish wellen_ext/window_api.pyi (signatures + docstrings) BEFORE implementing.",
+      "owns": ["wellen_ext/", "bench/results_windowed.json"]
+    },
+    "claude": {
+      "harness": "claude",
+      "model": "opus",
+      "task": "Finish tof_lazy/{session.py,tofd.py,cli.py,engine.py}, tests/test_e2e.py and the live Surfer WCP hop-mirroring demo. Code against wellen_ext/window_api.pyi; don't edit wellen_ext/.",
+      "owns": ["tof_lazy/", "tests/test_e2e.py", "demo/"]
+    },
+    "agy": {
+      "harness": "agy",
+      "cmd": ["agy", "{prompt}"],
+      "task": "Independent reviewer: once codex reports done, verify windowed decode preserves boundary values and sampling semantics. Write findings to .swarm/reports/agy-review.md.",
+      "owns": [".swarm/reports/agy-review.md"]
+    }
+  },
+  "interfaces": {
+    "wellen_ext.window_api": {
+      "owner": "codex",
+      "consumers": ["claude", "agy"],
+      "stub": "wellen_ext/window_api.pyi"
+    }
+  }
+}

@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""swarm: deterministic coordination layer for a lead agent + worker agents in Rex.
+
+State lives in <project>/.swarm/swarm.db (SQLite, WAL). No daemon: every command is a
+short process; `swarm wait` polls the DB (zero tokens) until something needs the lead.
+
+Rex integration:
+  - panes are opened with `rex window new` (or `rex split` with --layout split)
+  - each pane runs `swarm agent-shell <name>`, which registers $REX_BLOCK / $REX_SESSION,
+    labels the block, then execs the real agent CLI
+  - messages reach a pane as ONE line via `rex send -b <block>` + `rex send-key enter`
+    (full text stays in the DB)
+  - swarm-watch.lua forwards Rex events (program status, child exit, block closed) to
+    `swarm event`
+Python 3.9+ stdlib only (PyYAML optional, for .yaml plans).
+"""
+import argparse, fnmatch, json, os, shlex, sqlite3, subprocess, sys, time
+
+HOME_STATE = os.path.expanduser("~/.swarm")
+CURRENT = os.path.join(HOME_STATE, "current")
+WAKE_KINDS = ("message", "report", "error", "exited", "blocked", "lock_conflict", "note", "closed")
+
+DEFAULT_CMDS = {
+    # {prompt} is replaced with the bootstrap prompt, {model} with the plan's model.
+    # Verify flags for your installed versions.
+    "agy":      ["agy", "--model", "{model}", "--prompt-interactive", "{prompt}"],
+    "claude":   ["claude", "--model", "{model}", "{prompt}"],
+    "codex":    ["codex", "-m", "{model}", "{prompt}"],
+    "opencode": ["opencode", "--model", "{model}", "--prompt", "{prompt}"],
+}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS agents(
+  name TEXT PRIMARY KEY, role TEXT, harness TEXT, task TEXT, cwd TEXT,
+  block_id TEXT, session_id TEXT, status TEXT DEFAULT 'starting', status_msg TEXT,
+  updated REAL);
+CREATE TABLE IF NOT EXISTS messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, frm TEXT, to_agent TEXT,
+  body TEXT, acked REAL, ack_note TEXT, delivered INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS locks(
+  path TEXT PRIMARY KEY, owner TEXT, reason TEXT, ts REAL, expires REAL);
+CREATE TABLE IF NOT EXISTS reports(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, agent TEXT, status TEXT,
+  summary TEXT, cmd TEXT, commit_ref TEXT, log TEXT, result TEXT);
+CREATE TABLE IF NOT EXISTS events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, agent TEXT,
+  for_agent TEXT, data TEXT, consumed INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS interfaces(
+  name TEXT PRIMARY KEY, owner TEXT, consumers TEXT, stub TEXT);
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
+"""
+
+# ---------------------------------------------------------------- plumbing
+
+def find_dir(explicit=None):
+    if explicit:
+        return os.path.abspath(explicit)
+    if os.environ.get("SWARM_DIR"):
+        return os.environ["SWARM_DIR"]
+    d = os.getcwd()
+    while True:
+        if os.path.join(d, ".swarm") != HOME_STATE and os.path.isdir(os.path.join(d, ".swarm")):
+            return os.path.join(d, ".swarm")
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    if os.path.exists(CURRENT):
+        return open(CURRENT).read().strip()
+    sys.exit("swarm: no .swarm/ found (run `swarm up plan.yaml` first, or set SWARM_DIR)")
+
+def db(sdir):
+    os.makedirs(sdir, exist_ok=True)
+    c = sqlite3.connect(os.path.join(sdir, "swarm.db"), timeout=10, isolation_level=None)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.executescript(SCHEMA)
+    return c
+
+def me(c=None):
+    if os.environ.get("SWARM_AGENT"):
+        return os.environ["SWARM_AGENT"]
+    blk = os.environ.get("REX_BLOCK")
+    if c is not None and blk:
+        r = c.execute("SELECT name FROM agents WHERE block_id=?", (blk,)).fetchone()
+        if r:
+            return r["name"]
+    return "user"
+
+def out(obj):
+    print(json.dumps(obj, separators=(",", ":"), default=str))
+
+def emit(c, ev_kind, agent=None, for_agent="lead", **data):
+    c.execute("INSERT INTO events(ts,kind,agent,for_agent,data) VALUES(?,?,?,?,?)",
+              (time.time(), ev_kind, agent, for_agent, json.dumps(data)))
+
+def lead_name(c):
+    r = c.execute("SELECT name FROM agents WHERE role='lead'").fetchone()
+    return r["name"] if r else "lead"
+
+def rex(*args, check=False):
+    try:
+        return subprocess.run(["rex", *args], capture_output=True, text=True, check=check)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(args, 127, "", "rex not on PATH")
+
+def lua_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+def one_line(s, n=180):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+def deliver(c, to, line):
+    """Type one line into an agent's pane. Returns True if Rex accepted it."""
+    a = c.execute("SELECT block_id, session_id FROM agents WHERE name=?", (to,)).fetchone()
+    if not a or not a["block_id"]:
+        return False
+    tgt = ["-b", a["block_id"]] + (["-s", a["session_id"]] if a["session_id"] else [])
+    r1 = rex("send", *tgt, line)
+    if r1.returncode != 0:
+        return False
+    # Codex groups rapid terminal input into a paste. Send Return after that window closes.
+    time.sleep(0.35)
+    return rex("send-key", *tgt, "enter").returncode == 0
+
+def maybe_b64(v):
+    import base64, re
+    if isinstance(v, str) and len(v) >= 8 and len(v) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/]+=*", v):
+        try:
+            t = base64.b64decode(v).decode("utf-8")
+            if t.isprintable():
+                return t
+        except Exception:
+            pass
+    return v
+
+def load_plan(path):
+    txt = open(path).read()
+    if path.endswith((".yaml", ".yml")):
+        try:
+            import yaml
+        except ImportError:
+            sys.exit("swarm: .yaml plan needs PyYAML (pip install pyyaml) or use plan.json")
+        return yaml.safe_load(txt)
+    return json.loads(txt)
+
+def locks_matching(c, path):
+    now = time.time()
+    rows = c.execute("SELECT * FROM locks WHERE expires IS NULL OR expires>?", (now,)).fetchall()
+    hits = []
+    for r in rows:
+        pat = r["path"].rstrip("/")
+        if (path == pat or path.startswith(pat + "/") or fnmatch.fnmatch(path, r["path"])):
+            hits.append(dict(r))
+    return hits
+
+# ---------------------------------------------------------------- commands
+
+def cmd_up(a):
+    plan = load_plan(a.plan)
+    root = os.path.abspath(plan.get("root", os.path.dirname(os.path.abspath(a.plan))))
+    sdir = os.path.join(root, ".swarm")
+    c = db(sdir)
+    os.makedirs(os.path.join(sdir, "tasks"), exist_ok=True)
+    os.makedirs(os.path.join(sdir, "reports"), exist_ok=True)
+    os.makedirs(HOME_STATE, exist_ok=True)
+    open(CURRENT, "w").write(sdir)
+    c.execute("INSERT OR REPLACE INTO kv VALUES('goal',?)", (plan.get("goal", ""),))
+    c.execute("INSERT OR REPLACE INTO kv VALUES('root',?)", (root,))
+
+    lead = me() if me() != "user" else plan.get("lead", "lead")
+    c.execute("INSERT OR IGNORE INTO agents(name,role,harness,status,updated) VALUES(?,?,?,?,?)",
+              (lead, "lead", plan.get("lead_harness", "?"), "working", time.time()))
+    c.execute("UPDATE agents SET role='lead', block_id=COALESCE(block_id,?), session_id=COALESCE(session_id,?) WHERE name=?",
+              (os.environ.get("REX_BLOCK"), os.environ.get("REX_SESSION"), lead))
+
+    for name, iface in (plan.get("interfaces") or {}).items():
+        c.execute("INSERT OR REPLACE INTO interfaces VALUES(?,?,?,?)",
+                  (name, iface.get("owner"), json.dumps(iface.get("consumers", [])), iface.get("stub")))
+
+    launched = []
+    for name, w in (plan.get("workers") or {}).items():
+        harness = w.get("harness", name.split("-")[0])
+        cwd = root
+        if w.get("worktree"):
+            cwd = os.path.join(sdir, "wt", name)
+            if not os.path.exists(cwd):
+                subprocess.run(["git", "-C", root, "worktree", "add", "-b", "swarm/" + name, cwd],
+                               check=True, capture_output=True)
+        cwd = os.path.abspath(os.path.join(root, w["cwd"])) if w.get("cwd") else cwd
+        task_md = (f"# Task for {name}\n\nGoal of the team: {plan.get('goal','')}\n\n"
+                   f"## Your task\n{w.get('task','')}\n\n"
+                   f"## You own\n" + "\n".join(f"- `{p}`" for p in w.get("owns", [])) + "\n\n"
+                   f"## Do not edit\nAnything locked by another agent (`swarm locks`).\n\n"
+                   f"## Notes\n{w.get('notes','')}\n")
+        open(os.path.join(sdir, "tasks", name + ".md"), "w").write(task_md)
+        c.execute("INSERT OR REPLACE INTO agents(name,role,harness,task,cwd,status,updated) VALUES(?,?,?,?,?,?,?)",
+                  (name, "worker", harness, w.get("task", ""), cwd, "starting", time.time()))
+        for p in w.get("owns", []):
+            c.execute("INSERT OR REPLACE INTO locks VALUES(?,?,?,?,NULL)", (p, name, "owner (plan)", time.time()))
+
+        prompt = (f"You are swarm worker '{name}'. Use the swarm-worker skill. "
+                  f"Your task is in {os.path.join(sdir,'tasks',name+'.md')}. Start by running: swarm ack --start")
+        tmpl = w.get("cmd") or DEFAULT_CMDS.get(harness)
+        if not tmpl:
+            sys.exit(f"swarm: no command for harness '{harness}'; set workers.{name}.cmd in the plan")
+        model = w.get("model")
+        argv = []
+        for t in tmpl:
+            if "{model}" in t and not model:
+                if argv and argv[-1].startswith("-"):
+                    argv.pop()          # drop the flag preceding {model}
+                continue
+            argv.append(t.replace("{model}", model or "").replace("{prompt}", prompt))
+        env = {"SWARM_AGENT": name, "SWARM_DIR": sdir}
+        if not a.no_rex:
+            open_pane(name, cwd, argv, env, a.layout)
+        launched.append({"agent": name, "cwd": cwd, "argv": argv})
+
+    install_hook(root)
+    if not a.no_rex:
+        start_watcher(sdir)
+    out({"ok": True, "dir": sdir, "lead": lead, "launched": launched})
+
+def open_pane(name, cwd, argv, env, layout):
+    inner = ["env"] + [f"{k}={v}" for k, v in env.items()] + [os.path.abspath(sys.argv[0]), "agent-shell", name, "--"] + argv
+    session = os.environ.get("REX_SESSION")
+    anchor = os.environ.get("REX_BLOCK")
+    target = ["-s", session] if session else []
+    if layout == "split" and anchor:
+        args = ["split", *target, "-b", anchor, "--label", name]
+    else:
+        args = ["window", "new", *target, name]
+    r = rex(*args, "-c", cwd, "--keep-open", "--focus=false", "--", *inner)
+    if r.returncode != 0:
+        sys.exit(f"swarm: rex failed to open pane for {name}: {r.stderr.strip()}")
+
+def start_watcher(sdir):
+    pidf = os.path.join(sdir, "watch.pid")
+    if os.path.exists(pidf):
+        try:
+            os.kill(int(open(pidf).read()), 0)
+            return
+        except Exception:
+            pass
+    script = os.environ.get("SWARM_WATCH_LUA", os.path.expanduser("~/.config/rex/swarm-watch.lua"))
+    if not os.path.exists(script):
+        print(f"swarm: {script} missing; Rex events won't be forwarded", file=sys.stderr)
+        return
+    log = open(os.path.join(sdir, "watch.log"), "a")
+    p = subprocess.Popen(["rex", "do", script, "--all"], stdout=log, stderr=log,
+                         start_new_session=True, env={**os.environ, "SWARM_DIR": sdir})
+    open(pidf, "w").write(str(p.pid))
+
+def install_hook(root):
+    gitdir = os.path.join(root, ".git")
+    if not os.path.isdir(gitdir):
+        return
+    hook = os.path.join(gitdir, "hooks", "pre-commit")
+    marker = "# swarm-lock-hook"
+    body = f'{marker}\nif [ -n "$SWARM_AGENT" ] && command -v swarm >/dev/null; then\n  git diff --cached --name-only | swarm check-commit || exit 1\nfi\n'
+    existing = open(hook).read() if os.path.exists(hook) else "#!/bin/sh\n"
+    if marker not in existing:
+        open(hook, "w").write(existing.rstrip("\n") + "\n" + body)
+        os.chmod(hook, 0o755)
+
+def cmd_agent_shell(a):
+    """Runs inside the new pane: register Rex ids, label the block, exec the agent."""
+    sdir = find_dir()
+    c = db(sdir)
+    blk, ses = os.environ.get("REX_BLOCK"), os.environ.get("REX_SESSION")
+    c.execute("UPDATE agents SET block_id=?, session_id=?, status='working', updated=? WHERE name=?",
+              (blk, ses, time.time(), a.name))
+    if blk:
+        rex("do", "-e", f"rex.session.set_block_label{{ block_id = {lua_str(blk)}, label = {lua_str('swarm:'+a.name)} }}")
+    c.close()
+    argv = a.argv[1:] if a.argv and a.argv[0] == "--" else a.argv
+    if not argv:
+        sys.exit("swarm agent-shell: no command")
+    os.execvp(argv[0], argv)
+
+def cmd_send(a):
+    c = db(find_dir())
+    frm = me(c)
+    targets = [a.to]
+    if a.to == "all":
+        targets = [r["name"] for r in c.execute("SELECT name FROM agents WHERE name!=?", (frm,))]
+    ids = []
+    for t in targets:
+        cur = c.execute("INSERT INTO messages(ts,frm,to_agent,body) VALUES(?,?,?,?)",
+                        (time.time(), frm, t, a.body))
+        mid = cur.lastrowid
+        ids.append(mid)
+        role = c.execute("SELECT role FROM agents WHERE name=?", (t,)).fetchone()
+        is_lead = bool(role and role["role"] == "lead")
+        if is_lead:
+            # the lead hears messages through `swarm wait`, never via its pane
+            emit(c, "message", agent=frm, for_agent=t, msg_id=mid, body=one_line(a.body, 400))
+        line = f"[swarm #{mid} from {frm}] {one_line(a.body)}  (full: swarm inbox {mid}; then swarm ack {mid})"
+        ok = deliver(c, t, line) if not (a.no_type or is_lead) else False
+        c.execute("UPDATE messages SET delivered=? WHERE id=?", (2 if is_lead else (1 if ok else 0), mid))
+    out({"ok": True, "ids": ids})
+
+def cmd_inbox(a):
+    c = db(find_dir())
+    who = a.agent or me(c)
+    if a.id:
+        r = c.execute("SELECT * FROM messages WHERE id=?", (a.id,)).fetchone()
+        out(dict(r) if r else {"error": "no such message"})
+        return
+    q = "SELECT id,ts,frm,body,acked FROM messages WHERE to_agent=?" + ("" if a.all else " AND acked IS NULL") + " ORDER BY id"
+    out([dict(r) for r in c.execute(q, (who,))])
+
+def cmd_ack(a):
+    c = db(find_dir())
+    who = me(c)
+    if a.start:
+        c.execute("UPDATE agents SET status='working', updated=? WHERE name=?", (time.time(), who))
+        pending = [dict(r) for r in c.execute("SELECT id,frm,body FROM messages WHERE to_agent=? AND acked IS NULL", (who,))]
+        locks = [dict(r) for r in c.execute("SELECT path,owner FROM locks WHERE owner!=?", (who,))]
+        sdir = find_dir()
+        out({"agent": who, "task_file": os.path.join(sdir, "tasks", who + ".md"),
+             "locked_by_others": locks, "unread": pending})
+        return
+    c.execute("UPDATE messages SET acked=?, ack_note=? WHERE id=? AND acked IS NULL",
+              (time.time(), a.note or "", a.id))
+    m = c.execute("SELECT frm FROM messages WHERE id=?", (a.id,)).fetchone()
+    if m and m["frm"] not in ("user", who):
+        emit(c, "ack", agent=who, for_agent=m["frm"], msg_id=a.id, note=one_line(a.note or "", 300))
+    out({"ok": True})
+
+def cmd_report(a):
+    sdir = find_dir()
+    c = db(sdir)
+    who = me(c)
+    summary = one_line(a.summary, 600)
+    c.execute("INSERT INTO reports(ts,agent,status,summary,cmd,commit_ref,log,result) VALUES(?,?,?,?,?,?,?,?)",
+              (time.time(), who, a.status, summary, a.cmd, a.commit, a.log, a.result))
+    c.execute("UPDATE agents SET status=?, status_msg=?, updated=? WHERE name=?",
+              (a.status, summary[:120], time.time(), who))
+    if a.status in ("done", "error", "blocked"):
+        emit(c, "report" if a.status != "error" else "error", agent=who, for_agent=lead_name(c),
+             status=a.status, summary=summary, cmd=a.cmd, commit=a.commit, log=a.log, result=a.result)
+        if a.status == "done" and a.release:
+            c.execute("DELETE FROM locks WHERE owner=?", (who,))
+    out({"ok": True})
+
+def cmd_ask(a):
+    a.to = a.to or None
+    c = db(find_dir())
+    a2 = argparse.Namespace(to=a.to or lead_name(c), body=a.body, no_type=False)
+    cmd_send(a2)
+
+def cmd_wait(a):
+    c = db(find_dir())
+    who = a.agent or me(c)
+    if who == "user":
+        who = lead_name(c)
+    deadline = time.time() + a.timeout
+    kinds = a.kinds.split(",") if a.kinds else None
+    while True:
+        rows = c.execute("SELECT * FROM events WHERE consumed=0 AND (for_agent=? OR for_agent='*') ORDER BY id",
+                         (who,)).fetchall()
+        rows = [r for r in rows if not kinds or r["kind"] in kinds]
+        if rows:
+            batch = rows[: a.max]
+            c.executemany("UPDATE events SET consumed=1 WHERE id=?", [(r["id"],) for r in batch])
+            for r in batch:   # the lead has now seen these messages: count them as acked
+                if r["kind"] == "message":
+                    mid = json.loads(r["data"] or "{}").get("msg_id")
+                    c.execute("UPDATE messages SET acked=?, ack_note='seen via wait' WHERE id=? AND acked IS NULL", (time.time(), mid))
+            evs = [{k: v for k, v in {"id": r["id"], "kind": r["kind"], "agent": r["agent"],
+                                      **json.loads(r["data"] or "{}")}.items() if v is not None} for r in batch]
+            out({"events": evs, "more": len(rows) - len(batch)})
+            return
+        if time.time() >= deadline:
+            out({"events": [], "timeout": True, "hint": "nothing needs you; call swarm wait again"})
+            return
+        time.sleep(a.poll)
+
+def cmd_lock(a):
+    c = db(find_dir())
+    owner = a.owner or me(c)
+    exp = time.time() + a.ttl * 60 if a.ttl else None
+    held = [l for l in locks_matching(c, a.path) if l["owner"] != owner]
+    if held and not a.force:
+        emit(c, "lock_conflict", agent=owner, for_agent=lead_name(c), path=a.path, held_by=held[0]["owner"])
+        out({"ok": False, "held_by": held[0]["owner"], "reason": held[0]["reason"]})
+        sys.exit(1)
+    c.execute("INSERT OR REPLACE INTO locks VALUES(?,?,?,?,?)", (a.path, owner, a.reason or "", time.time(), exp))
+    out({"ok": True})
+
+def cmd_unlock(a):
+    c = db(find_dir())
+    n = c.execute("DELETE FROM locks WHERE path=?", (a.path,)).rowcount
+    out({"ok": True, "removed": n})
+
+def cmd_locks(a):
+    c = db(find_dir())
+    out([dict(r) for r in c.execute("SELECT path,owner,reason FROM locks ORDER BY owner")])
+
+def cmd_check_commit(a):
+    c = db(find_dir())
+    who = me(c)
+    bad = []
+    for line in sys.stdin:
+        p = line.strip()
+        if not p:
+            continue
+        for l in locks_matching(c, p):
+            if l["owner"] != who:
+                bad.append((p, l["owner"]))
+    if bad:
+        for p, o in bad:
+            print(f"swarm: {p} is locked by {o}", file=sys.stderr)
+        emit(c, "lock_conflict", agent=who, for_agent=lead_name(c), paths=[p for p, _ in bad])
+        sys.exit(1)
+
+def cmd_affected(a):
+    c = db(find_dir())
+    hit = set()
+    r = c.execute("SELECT * FROM interfaces WHERE name=?", (a.what,)).fetchone()
+    if r:
+        hit.add(r["owner"])
+        hit.update(json.loads(r["consumers"] or "[]"))
+    for l in locks_matching(c, a.what):
+        hit.add(l["owner"])
+    for r in c.execute("SELECT * FROM interfaces"):
+        if r["owner"] in hit:
+            hit.update(json.loads(r["consumers"] or "[]"))
+    hit.discard(None)
+    out(sorted(hit))
+
+def cmd_status(a):
+    c = db(find_dir())
+    ag = [dict(r) for r in c.execute("SELECT name,role,harness,status,status_msg,block_id FROM agents")]
+    unacked = c.execute("SELECT to_agent, COUNT(*) n FROM messages WHERE acked IS NULL GROUP BY to_agent").fetchall()
+    ua = {r["to_agent"]: r["n"] for r in unacked}
+    for x in ag:
+        x["unacked"] = ua.get(x["name"], 0)
+        if not a.verbose:
+            x.pop("block_id", None)
+    out(ag)
+
+def cmd_log(a):
+    c = db(find_dir())
+    r = c.execute("SELECT block_id, session_id FROM agents WHERE name=?", (a.agent,)).fetchone()
+    if not r or not r["block_id"]:
+        sys.exit("swarm: agent has no Rex block")
+    p = rex("capture", "-s", r["session_id"], "-b", r["block_id"], "--trim", "--unwrap")
+    lines = p.stdout.rstrip("\n").splitlines()
+    print("\n".join(lines[-a.tail:]))
+
+def cmd_event(a):
+    """Called by swarm-watch.lua with one Rex event as JSON."""
+    c = db(find_dir())
+    ev = json.loads(a.json if a.json != "-" else sys.stdin.read())
+    blk = ev.get("block_id") or (ev.get("ctx") or {}).get("block_id")
+    row = c.execute("SELECT name, role FROM agents WHERE block_id=?", (blk,)).fetchone() if blk else None
+    if not row:
+        return
+    name = row["name"]
+    lead = lead_name(c)
+    kind = (ev.get("name") or ev.get("event") or "").split(".")[-1]
+    if kind == "program_status_changed":
+        rec = ev.get("record") or {}
+        state = rec.get("state")
+        msg = rec.get("msg") or rec.get("message") or ""
+        msg = maybe_b64(msg)
+        prev = c.execute("SELECT status FROM agents WHERE name=?", (name,)).fetchone()["status"]
+        c.execute("UPDATE agents SET status=?, status_msg=?, updated=? WHERE name=?",
+                  (state, one_line(str(msg), 120), time.time(), name))
+        if state == "blocked" and prev != "blocked" and row["role"] != "lead":
+            emit(c, "blocked", agent=name, for_agent=lead, need=rec.get("kind"), msg=one_line(str(msg), 200))
+        if state == "idle" and prev == "working" and row["role"] != "lead":
+            # worker went idle without reporting: likely finished a turn or stalled
+            last = c.execute("SELECT ts FROM reports WHERE agent=? ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+            if not last or time.time() - last["ts"] > 30:
+                emit(c, "idle_unreported", agent=name, for_agent=lead)
+    elif kind == "child_exited":
+        c.execute("UPDATE agents SET status='exited', updated=? WHERE name=?", (time.time(), name))
+        if row["role"] != "lead":
+            emit(c, "exited", agent=name, for_agent=lead, exit_code=ev.get("exit_code"))
+            c.execute("DELETE FROM locks WHERE owner=? AND reason!='owner (plan)'", (name,))
+    elif kind == "block_closed":
+        c.execute("UPDATE agents SET status='closed', block_id=NULL WHERE name=?", (name,))
+        if row["role"] != "lead":
+            emit(c, "closed", agent=name, for_agent=lead)
+
+def cmd_note(a):
+    """Human -> lead note that wakes `swarm wait` without typing into the lead's pane."""
+    c = db(find_dir())
+    emit(c, "note", agent="user", for_agent=lead_name(c), body=a.body)
+    out({"ok": True})
+
+def cmd_focus(a):
+    c = db(find_dir())
+    if a.agent == "next-waiting":
+        r = c.execute("SELECT name FROM agents WHERE status IN ('blocked','error','done') ORDER BY updated").fetchone()
+        if not r:
+            out({"ok": False, "reason": "nobody is waiting"})
+            return
+        a.agent = r["name"]
+    r = c.execute("SELECT block_id FROM agents WHERE name=?", (a.agent,)).fetchone()
+    if r and r["block_id"]:
+        rex("do", "-e", f"rex.session.focus_block{{ block_id = {lua_str(r['block_id'])} }}")
+    out({"ok": True, "agent": a.agent})
+
+def cmd_board(a):
+    sdir = find_dir()
+    while True:
+        c = db(sdir)
+        goal = (c.execute("SELECT v FROM kv WHERE k='goal'").fetchone() or {"v": ""})["v"]
+        lines = [f"\x1b[1mswarm\x1b[0m  {goal}", ""]
+        ua = {r["to_agent"]: r["n"] for r in c.execute(
+            "SELECT to_agent, COUNT(*) n FROM messages WHERE acked IS NULL GROUP BY to_agent")}
+        colors = {"working": 34, "blocked": 33, "error": 31, "done": 32, "idle": 90, "exited": 90}
+        for r in c.execute("SELECT * FROM agents ORDER BY role, name"):
+            col = colors.get(r["status"] or "", 37)
+            lines.append(f"  \x1b[{col}m●\x1b[0m {r['name']:<12} {r['role']:<7} {(r['status'] or ''):<9} "
+                         f"unacked:{ua.get(r['name'],0)}  {r['status_msg'] or ''}"[:160])
+        lines += ["", "\x1b[1mlocks\x1b[0m"]
+        for r in c.execute("SELECT * FROM locks ORDER BY owner"):
+            lines.append(f"  {r['path']:<32} {r['owner']:<12} {r['reason'] or ''}")
+        lines += ["", "\x1b[1mrecent\x1b[0m"]
+        for r in c.execute("SELECT * FROM reports ORDER BY id DESC LIMIT 6"):
+            lines.append(f"  {time.strftime('%H:%M', time.localtime(r['ts']))} {r['agent']:<10} {r['status']:<7} {r['summary'][:100]}")
+        for r in c.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 6"):
+            st = "acked" if r["acked"] else {2: "to lead", 1: "queued"}.get(r["delivered"], "undelivered")
+            lines.append(f"  #{r['id']:<4} {r['frm']}→{r['to_agent']:<10} {st:<11} {one_line(r['body'], 80)}")
+        c.close()
+        sys.stdout.write("\x1b[H\x1b[2J" + "\n".join(lines) + "\n")
+        sys.stdout.flush()
+        if a.once:
+            return
+        time.sleep(a.interval)
+
+def cmd_down(a):
+    sdir = find_dir()
+    c = db(sdir)
+    pidf = os.path.join(sdir, "watch.pid")
+    if os.path.exists(pidf):
+        try:
+            os.kill(int(open(pidf).read()), 15)
+        except Exception:
+            pass
+        os.remove(pidf)
+    if a.close:
+        for r in c.execute("SELECT name, block_id FROM agents WHERE role='worker' AND block_id IS NOT NULL"):
+            deliver(c, r["name"], "[swarm] session ending, stop work and report.")
+    c.execute("DELETE FROM locks")
+    out({"ok": True})
+
+# ---------------------------------------------------------------- argparse
+
+def main():
+    p = argparse.ArgumentParser(prog="swarm")
+    s = p.add_subparsers(dest="cmd", required=True)
+
+    x = s.add_parser("up", help="create state, open worker panes"); x.add_argument("plan")
+    x.add_argument("--no-rex", action="store_true"); x.add_argument("--layout", choices=["window", "split"], default="split")
+    x.set_defaults(f=cmd_up)
+    x = s.add_parser("agent-shell"); x.add_argument("name"); x.add_argument("argv", nargs=argparse.REMAINDER); x.set_defaults(f=cmd_agent_shell)
+    x = s.add_parser("send", help="message an agent (or 'all')"); x.add_argument("to"); x.add_argument("body")
+    x.add_argument("--no-type", action="store_true"); x.set_defaults(f=cmd_send)
+    x = s.add_parser("ask", help="worker -> lead question"); x.add_argument("body"); x.add_argument("--to"); x.set_defaults(f=cmd_ask)
+    x = s.add_parser("inbox"); x.add_argument("id", nargs="?", type=int); x.add_argument("--agent"); x.add_argument("--all", action="store_true"); x.set_defaults(f=cmd_inbox)
+    x = s.add_parser("ack"); x.add_argument("id", nargs="?", type=int); x.add_argument("note", nargs="?")
+    x.add_argument("--start", action="store_true"); x.set_defaults(f=cmd_ack)
+    x = s.add_parser("report"); x.add_argument("--status", required=True, choices=["working", "done", "error", "blocked"])
+    x.add_argument("--summary", required=True); x.add_argument("--cmd"); x.add_argument("--commit"); x.add_argument("--log"); x.add_argument("--result")
+    x.add_argument("--release", action="store_true", help="release your locks when done"); x.set_defaults(f=cmd_report)
+    x = s.add_parser("wait", help="block until an event needs you")
+    x.add_argument("--timeout", type=float, default=float(os.environ.get("SWARM_WAIT_TIMEOUT", 540)))
+    x.add_argument("--poll", type=float, default=1.0); x.add_argument("--max", type=int, default=5)
+    x.add_argument("--kinds"); x.add_argument("--agent"); x.set_defaults(f=cmd_wait)
+    x = s.add_parser("lock"); x.add_argument("path"); x.add_argument("--owner"); x.add_argument("--reason")
+    x.add_argument("--ttl", type=float, help="minutes"); x.add_argument("--force", action="store_true"); x.set_defaults(f=cmd_lock)
+    x = s.add_parser("unlock"); x.add_argument("path"); x.set_defaults(f=cmd_unlock)
+    x = s.add_parser("locks"); x.set_defaults(f=cmd_locks)
+    x = s.add_parser("check-commit"); x.set_defaults(f=cmd_check_commit)
+    x = s.add_parser("affected"); x.add_argument("what"); x.set_defaults(f=cmd_affected)
+    x = s.add_parser("status"); x.add_argument("-v", "--verbose", action="store_true"); x.set_defaults(f=cmd_status)
+    x = s.add_parser("log"); x.add_argument("agent"); x.add_argument("--tail", type=int, default=40); x.set_defaults(f=cmd_log)
+    x = s.add_parser("event"); x.add_argument("json", nargs="?", default="-"); x.set_defaults(f=cmd_event)
+    x = s.add_parser("note", help="human note to the lead"); x.add_argument("body"); x.set_defaults(f=cmd_note)
+    x = s.add_parser("focus"); x.add_argument("agent"); x.set_defaults(f=cmd_focus)
+    x = s.add_parser("board"); x.add_argument("--once", action="store_true"); x.add_argument("--interval", type=float, default=2.0); x.set_defaults(f=cmd_board)
+    x = s.add_parser("down"); x.add_argument("--close", action="store_true"); x.set_defaults(f=cmd_down)
+
+    a = p.parse_args()
+    a.f(a)
+
+if __name__ == "__main__":
+    main()
