@@ -35,7 +35,7 @@ Turn the user's request into a plan file at the repo root, `swarm-plan.json` (or
 
 - Use the harnesses and models the user named. For a harness without a default (for example `agy`), set `"cmd": ["agy", "{prompt}"]` with the right binary and flags, or ask the user.
 - Model pinning per harness (verified against `--help`):
-  - `opencode`: root command has NO `--model` (only `mini`/`run` do). Never use `opencode mini --model` for workers: it needs a TTY, crashes, and is not the sustained TUI. Use full `opencode --prompt "{prompt}"` (the `bin/swarm` default) and pin the model in `opencode.jsonc`: `{"model": "opencode-go/muse-spark-1.3-contributor"}` in `./opencode.jsonc` or `~/.config/opencode/opencode.jsonc`.
+  - `opencode`: root command has NO `--model` (only `mini`/`run` do). Never use `opencode mini --model` for workers: it needs a TTY, crashes, and is not the sustained TUI. Default is `opencode --standalone --auto --prompt "{prompt}"`: `--standalone` gives each pane a private server (shared `serve --service` causes cross-pane freeze and ghost writers that keep mutating files after a pane exits), `--auto` avoids blocking permission prompts, and the plan's `"model"` is injected as `OPENCODE_CONFIG_CONTENT='{"model":"<provider/model>"}'` (e.g. `opencode-go/muse-spark-1.3-contributor`). `opencode.jsonc` `"model"` is only a fallback.
   - `claude`: `claude --model <alias|full-name> "{prompt}"`.
   - `codex`: `codex -m <model> "{prompt}"`.
   - `agy`: `agy --model <model> --prompt-interactive "{prompt}"`.

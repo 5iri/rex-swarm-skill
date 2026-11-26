@@ -23,11 +23,14 @@ WAKE_KINDS = ("message", "report", "error", "exited", "blocked", "lock_conflict"
 DEFAULT_CMDS = {
     # {prompt} is replaced with the bootstrap prompt, {model} with the plan's model.
     # Verify flags for your installed versions.
-    # opencode: root has no --model; pin via opencode.jsonc "model". Never use mini for workers (TTY-only, crashes).
+    # opencode: root has no --model. --standalone gives each pane a private
+    # server (shared server causes cross-pane freeze + ghost writers).
+    # --auto avoids blocking permission prompts. Model comes from the plan
+    # via OPENCODE_CONFIG_CONTENT (see cmd_up), not a CLI flag. Never use mini.
     "agy":      ["agy", "--model", "{model}", "--prompt-interactive", "{prompt}"],
     "claude":   ["claude", "--model", "{model}", "{prompt}"],
     "codex":    ["codex", "-m", "{model}", "{prompt}"],
-    "opencode": ["opencode", "--prompt", "{prompt}"],
+    "opencode": ["opencode", "--standalone", "--auto", "--prompt", "{prompt}"],
 }
 
 SCHEMA = """
@@ -215,6 +218,8 @@ def cmd_up(a):
                 continue
             argv.append(t.replace("{model}", model or "").replace("{prompt}", prompt))
         env = {"SWARM_AGENT": name, "SWARM_DIR": sdir}
+        if harness == "opencode" and model:
+            env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"model": model})
         if not a.no_rex:
             open_pane(name, cwd, argv, env, a.layout)
         launched.append({"agent": name, "cwd": cwd, "argv": argv})
