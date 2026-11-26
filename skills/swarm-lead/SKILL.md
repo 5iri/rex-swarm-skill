@@ -82,7 +82,7 @@ When the user or you change an interface or path contract: `swarm affected <inte
 
 ## 4. Finish
 
-When every worker's acceptance check has evidence, tell the user what landed (agent, commit, test command, result) and ask before `swarm down`.
+When every worker's acceptance check has evidence, tell the user what landed (agent, commit, test command, result) and ask before `swarm down`. `swarm down` closes all worker panes itself (lead pane stays); `--close` messages them first.
 
 ## Command reference
 

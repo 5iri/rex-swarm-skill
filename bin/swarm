@@ -547,6 +547,7 @@ def cmd_board(a):
         time.sleep(a.interval)
 
 def cmd_down(a):
+    """Tear down: stop the watcher, close worker panes, clear locks. The lead pane is never touched."""
     sdir = find_dir()
     c = db(sdir)
     pidf = os.path.join(sdir, "watch.pid")
@@ -555,12 +556,25 @@ def cmd_down(a):
             os.kill(int(open(pidf).read()), 15)
         except Exception:
             pass
-        os.remove(pidf)
+        try:
+            os.remove(pidf)
+        except OSError:
+            pass
     if a.close:
-        for r in c.execute("SELECT name, block_id FROM agents WHERE role='worker' AND block_id IS NOT NULL"):
+        for r in c.execute("SELECT name FROM agents WHERE role='worker'"):
             deliver(c, r["name"], "[swarm] session ending, stop work and report.")
+        time.sleep(1.0)
+    closed = []
+    for r in c.execute("SELECT name, block_id, session_id FROM agents WHERE role='worker' AND block_id IS NOT NULL"):
+        args = ["block", "close"]
+        if r["session_id"]:
+            args += ["-s", r["session_id"]]
+        args.append(r["block_id"])
+        if rex(*args).returncode == 0:
+            closed.append(r["name"])
+    c.execute("UPDATE agents SET status='closed', block_id=NULL WHERE role='worker'")
     c.execute("DELETE FROM locks")
-    out({"ok": True})
+    out({"ok": True, "closed": closed})
 
 # ---------------------------------------------------------------- argparse
 
@@ -597,7 +611,7 @@ def main():
     x = s.add_parser("note", help="human note to the lead"); x.add_argument("body"); x.set_defaults(f=cmd_note)
     x = s.add_parser("focus"); x.add_argument("agent"); x.set_defaults(f=cmd_focus)
     x = s.add_parser("board"); x.add_argument("--once", action="store_true"); x.add_argument("--interval", type=float, default=2.0); x.set_defaults(f=cmd_board)
-    x = s.add_parser("down"); x.add_argument("--close", action="store_true"); x.set_defaults(f=cmd_down)
+    x = s.add_parser("down", help="close worker panes, stop watcher, clear locks"); x.add_argument("--close", action="store_true", help="message workers before closing their panes"); x.set_defaults(f=cmd_down)
 
     a = p.parse_args()
     a.f(a)
