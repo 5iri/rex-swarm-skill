@@ -34,6 +34,12 @@ Turn the user's request into a plan file at the repo root, `swarm-plan.json` (or
 ```
 
 - Use the harnesses and models the user named. For a harness without a default (for example `agy`), set `"cmd": ["agy", "{prompt}"]` with the right binary and flags, or ask the user.
+- Model pinning per harness (verified against `--help`):
+  - `opencode`: root command has NO `--model` (only `mini`/`run` do). Never use `opencode mini --model` for workers: it needs a TTY, crashes, and is not the sustained TUI. Use full `opencode --prompt "{prompt}"` (the `bin/swarm` default) and pin the model in `opencode.jsonc`: `{"model": "opencode-go/muse-spark-1.3-contributor"}` in `./opencode.jsonc` or `~/.config/opencode/opencode.jsonc`.
+  - `claude`: `claude --model <alias|full-name> "{prompt}"`.
+  - `codex`: `codex -m <model> "{prompt}"`.
+  - `agy`: `agy --model <model> --prompt-interactive "{prompt}"`.
+  - If a worker omits `"model"`, `bin/swarm` drops that flag automatically.
 - Every editable path has exactly one owner. Overlap means conflicts later.
 - For each cross-worker interface: the owner publishes the stub (signatures plus docstrings) first, and consumers code against the stub.
 - Use `"worktree": true` for workers whose changes might conflict or that experiment. Leave it off for workers that need to see each other's files live.

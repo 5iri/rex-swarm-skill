@@ -5,6 +5,7 @@
 #   ~/.config/rex/swarm-watch.lua           Rex event forwarder (started by `swarm up`)
 #   ~/.claude/skills/swarm-{lead,worker}    Claude Code skills
 #   ~/.codex/skills/swarm-{lead,worker}     Codex skills (if ~/.codex exists)
+#   ~/.agents/skills/swarm-{lead,worker}    agy / Antigravity skills (if ~/.agents exists)
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 REX_CFG="${REX_CONFIG_DIR:-$HOME/.config/rex}"
@@ -20,7 +21,7 @@ else
   printf 'require("swarm")\n' > "$REX_CFG/init.lua"
 fi
 
-for d in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+for d in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
   parent=$(dirname "$d")
   [ -d "$parent" ] || continue
   mkdir -p "$d"

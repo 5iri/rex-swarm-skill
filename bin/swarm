@@ -23,10 +23,11 @@ WAKE_KINDS = ("message", "report", "error", "exited", "blocked", "lock_conflict"
 DEFAULT_CMDS = {
     # {prompt} is replaced with the bootstrap prompt, {model} with the plan's model.
     # Verify flags for your installed versions.
+    # opencode: root has no --model; pin via opencode.jsonc "model". Never use mini for workers (TTY-only, crashes).
     "agy":      ["agy", "--model", "{model}", "--prompt-interactive", "{prompt}"],
     "claude":   ["claude", "--model", "{model}", "{prompt}"],
     "codex":    ["codex", "-m", "{model}", "{prompt}"],
-    "opencode": ["opencode", "--model", "{model}", "--prompt", "{prompt}"],
+    "opencode": ["opencode", "--prompt", "{prompt}"],
 }
 
 SCHEMA = """
