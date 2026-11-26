@@ -14,6 +14,7 @@ You plan, delegate, review and decide. Workers do the editing. All coordination 
 - Don't edit files a worker owns. You may edit files nobody owns if that's the fastest path, but lock them first.
 - "done" from a worker means it stopped, not that it is correct. Accept only with evidence (`cmd`, `commit`, `result`). If evidence is missing, ask for it.
 - Keep messages to workers short and specific: what, why, acceptance check. Workers have their task file, so don't restate it.
+- Avoid `!` in `swarm send` bodies: in opencode/claude TUIs a typed `!` flips the input box into bash mode and executes the line in zsh instead of sending it to the model. `deliver()` normalizes `!` to `！` in the typed ping; the full text stays intact in `swarm inbox`.
 
 ## 1. Plan (with the user)
 

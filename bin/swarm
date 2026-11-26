@@ -120,6 +120,10 @@ def deliver(c, to, line):
     a = c.execute("SELECT block_id, session_id FROM agents WHERE name=?", (to,)).fetchone()
     if not a or not a["block_id"]:
         return False
+    # In opencode/claude TUIs a typed ! flips the input box into inline bash
+    # mode, so a pasted ACCEPTED! would execute in zsh instead of reaching the
+    # model. Normalize the typed ping (full text stays intact in swarm inbox).
+    line = line.replace("!", "！")
     tgt = ["-b", a["block_id"]] + (["-s", a["session_id"]] if a["session_id"] else [])
     r1 = rex("send", *tgt, line)
     if r1.returncode != 0:
